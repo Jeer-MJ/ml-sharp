@@ -252,10 +252,12 @@ def predict_face(
     gaussians_ndc = predictor(image_resized, disparity_factor)
     
     # Build intrinsics for unprojection
+    # Note: We use -f_px for the Y component because image coordinates have Y pointing
+    # downward, while camera/world coordinates have Y pointing upward.
     intrinsics = torch.tensor(
         [
             [f_px, 0, width / 2, 0],
-            [0, f_px, height / 2, 0],
+            [0, -f_px, height / 2, 0],  # Negative f_y for Y-down image coordinates
             [0, 0, 1, 0],
             [0, 0, 0, 1],
         ],

@@ -76,14 +76,14 @@ def get_face_rotation_matrix(face: CubeFace) -> np.ndarray:
         
         CubeFace.TOP: np.array([
             [1, 0, 0],
-            [0, 0, 1],
-            [0, -1, 0]
+            [0, 0, -1],
+            [0, 1, 0]
         ], dtype=np.float32),  # -90° rotation around X (looking at +Y)
         
         CubeFace.BOTTOM: np.array([
             [1, 0, 0],
-            [0, 0, -1],
-            [0, 1, 0]
+            [0, 0, 1],
+            [0, -1, 0]
         ], dtype=np.float32),  # 90° rotation around X (looking at -Y)
     }
     return rotations[face]
