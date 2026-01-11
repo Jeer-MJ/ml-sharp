@@ -173,12 +173,12 @@ def predict_pano_cli(
             torch.device(device),
         )
         
-        # Filter gaussians within frustum (removes padding artifacts)
-        # Use stricter filtering with edge fade to reduce seams
+        # Filter gaussians within frustum (keep slightly more than 90° for overlap)
+        # Use edge fade to create a seamless transition between faces
         face_gaussians = filter_gaussians_in_face_frustum(
             face_gaussians, 
-            padding_ratio=0.12,  # Keep gaussians well within frustum
-            edge_fade_ratio=0.10,  # Fade opacity near edges
+            padding_ratio=-0.05,  # Keep up to 1.05 (5% overlap)
+            edge_fade_ratio=0.10,  # Fade from 0.95 to 1.05
         )
         
         # Transform to world coordinates
@@ -232,14 +232,10 @@ def predict_face(
     image_pt = torch.from_numpy(face_image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
     
-    # Calculate focal length for 90° FOV cubemap face
-    # For padded face, the effective FOV is larger
-    padded_size = config.face_size + 2 * int(config.face_size * config.padding_ratio)
-    
     # Focal length formula: f = (size/2) / tan(fov/2)
-    # For base 90° FOV: f = size/2
-    # For padded face with larger FOV, we scale accordingly
-    f_px = get_face_focal_length(padded_size)
+    # For a 90° FOV cubemap face, f = face_size / 2
+    # We use the internal core size (without padding) to maintain the 90° scale
+    f_px = get_face_focal_length(config.face_size)
     
     # The disparity factor is f_px / width (normalized)
     disparity_factor = torch.tensor([f_px / width]).float().to(device)
