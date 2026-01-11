@@ -213,21 +213,22 @@ class SlidingPyramidNetwork(BaseEncoder):
             # Step 1: split to create batched overlapped mini-images at the ViT
             # resolution.
             # 5x5 @ 384x384 at the highest resolution (1536x1536).
-            x0_patches = split(x0, overlap_ratio=0.25, patch_size=self.patch_size)
+            x0_patches, x0_steps_h, x0_steps_w = split(x0, overlap_ratio=0.25, patch_size=self.patch_size)
             # 3x3 @ 384x384 at the middle resolution (768x768).
-            x1_patches = split(x1, overlap_ratio=0.5, patch_size=self.patch_size)
+            x1_patches, x1_steps_h, x1_steps_w = split(x1, overlap_ratio=0.5, patch_size=self.patch_size)
             # 1x1 # 384x384 at the lowest resolution (384x384).
-            x2_patches = x2
+            # For large panoramic images, x2 might also be larger than patch_size, so we split it too (no overlap).
+            x2_patches, x2_steps_h, x2_steps_w = split(x2, overlap_ratio=0.0, patch_size=self.patch_size)
             padding = 3
         else:
             # Step 1: split to create batched overlapped mini-images at the ViT
             # resolution.
             # 4x4 @ 384x384 at the highest resolution (1536x1536).
-            x0_patches = split(x0, overlap_ratio=0.0, patch_size=self.patch_size)
+            x0_patches, x0_steps_h, x0_steps_w = split(x0, overlap_ratio=0.0, patch_size=self.patch_size)
             # 2x2 @ 384x384 at the middle resolution (768x768).
-            x1_patches = split(x1, overlap_ratio=0.0, patch_size=self.patch_size)
+            x1_patches, x1_steps_h, x1_steps_w = split(x1, overlap_ratio=0.0, patch_size=self.patch_size)
             # 1x1 # 384x384 at the lowest resolution (384x384).
-            x2_patches = x2
+            x2_patches, x2_steps_h, x2_steps_w = split(x2, overlap_ratio=0.0, patch_size=self.patch_size)
             padding = 0
         x0_tile_size = x0_patches.shape[0]
 
@@ -257,6 +258,8 @@ class SlidingPyramidNetwork(BaseEncoder):
         x_latent0_features = merge(
             x_latent0_encodings[: batch_size * x0_tile_size],
             batch_size=batch_size,
+            steps_h=x0_steps_h,
+            steps_w=x0_steps_w,
             padding=padding,
         )
 
@@ -266,6 +269,8 @@ class SlidingPyramidNetwork(BaseEncoder):
         x_latent1_features = merge(
             x_latent1_encodings[: batch_size * x0_tile_size],
             batch_size=batch_size,
+            steps_h=x0_steps_h,
+            steps_w=x0_steps_w,
             padding=padding,
         )
 
@@ -277,16 +282,44 @@ class SlidingPyramidNetwork(BaseEncoder):
         )
 
         # 96x96 feature maps by merging 5x5 @ 24x24 patches with overlaps.
-        x0_features = merge(x0_encodings, batch_size=batch_size, padding=padding)
+        x0_features = merge(
+            x0_encodings, 
+            batch_size=batch_size, 
+            steps_h=x0_steps_h,
+            steps_w=x0_steps_w,
+            padding=padding
+        )
 
         # 48x84 feature maps by merging 3x3 @ 24x24 patches with overlaps.
-        x1_features = merge(x1_encodings, batch_size=batch_size, padding=2 * padding)
+        x1_features = merge(
+            x1_encodings, 
+            batch_size=batch_size, 
+            steps_h=x1_steps_h,
+            steps_w=x1_steps_w,
+            padding=2 * padding
+        )
 
         # 24x24 feature maps.
-        x2_features = x2_encodings
+        # Ensure we treat x2 as tiled too (padding=0 as no overlap was used for x2)
+        x2_features = merge(
+            x2_encodings, 
+            batch_size=batch_size, 
+            steps_h=x2_steps_h,
+            steps_w=x2_steps_w,
+            padding=0
+        )
 
         # Apply the image encoder.
         x_lowres_features, image_intermediate_features = self.image_encoder(x2_patches)
+        
+        # Merge lowres features (padding=0)
+        x_lowres_features = merge(
+            x_lowres_features,
+            batch_size=batch_size,
+            steps_h=x2_steps_h,
+            steps_w=x2_steps_w,
+            padding=0
+        )
 
         # Upsample feature maps.
         x_latent0_features = checkpoint_wrapper(self, self.upsample_latent0, x_latent0_features)
@@ -308,46 +341,76 @@ class SlidingPyramidNetwork(BaseEncoder):
             x1_features,
             x_lowres_features,
         ]
+        
+        # Crop to ensure consistent spatial dimensions matching the input resolution.
+        # This removes any padding added during the split process.
+        input_h, input_w = x.shape[-2:]
+        scales = [2, 4, 8, 16, 32]
+        
+        cropped_output = []
+        for tensor, scale in zip(output, scales):
+            tgt_h, tgt_w = input_h // scale, input_w // scale
+            cropped_output.append(tensor[..., :tgt_h, :tgt_w])
 
-        return output
-
+        return cropped_output
 
 # It seems that torch.fx.wrap can only be applied to functions, not methods.
 # Hence, split and merge were converted into functions to be marked as atomic
 # operations for symbolic tracing.
 @torch.fx.wrap
-def split(image: torch.Tensor, overlap_ratio: float = 0.25, patch_size: int = 384) -> torch.Tensor:
+def split(
+    image: torch.Tensor,
+    overlap_ratio: float = 0.25,
+    patch_size: int = 384,
+) -> tuple[torch.Tensor, int, int]:
     """Split the input into small patches with sliding window."""
     patch_stride = int(patch_size * (1 - overlap_ratio))
-
-    image_size = image.shape[-1]
-    steps = int(math.ceil((image_size - patch_size) / patch_stride)) + 1
+    
+    height, width = image.shape[-2:]
+    
+    steps_h = int(math.ceil((height - patch_size) / patch_stride)) + 1
+    steps_w = int(math.ceil((width - patch_size) / patch_stride)) + 1
 
     x_patch_list = []
-    for j in range(steps):
+    for j in range(steps_h):
         j0 = j * patch_stride
         j1 = j0 + patch_size
-
-        for i in range(steps):
+        
+        for i in range(steps_w):
             i0 = i * patch_stride
             i1 = i0 + patch_size
-            x_patch_list.append(image[..., j0:j1, i0:i1])
+            patch = image[..., j0:j1, i0:i1]
+            
+            # Check if padding is needed
+            if patch.shape[-2] < patch_size or patch.shape[-1] < patch_size:
+                pad_h = patch_size - patch.shape[-2]
+                pad_w = patch_size - patch.shape[-1]
+                # F.pad arg format: (left, right, top, bottom)
+                patch = F.pad(patch, (0, pad_w, 0, pad_h), mode='replicate')
+                
+            x_patch_list.append(patch)
 
-    return torch.cat(x_patch_list, dim=0)
+    return torch.cat(x_patch_list, dim=0), steps_h, steps_w
 
 
 # Decorator marking function as an atomic operator for symbolic tracing.
 @torch.fx.wrap
-def merge(image_patches: torch.Tensor, batch_size: int, padding: int = 3) -> torch.Tensor:
+def merge(
+    image_patches: torch.Tensor,
+    batch_size: int,
+    steps_h: int,
+    steps_w: int,
+    padding: int = 3,
+) -> torch.Tensor:
     """Merge the patched input into a image with sliding window."""
-    steps = int(math.sqrt(image_patches.shape[0] // batch_size))
+    # steps_h and steps_w are passed directly now
 
     idx = 0
 
     output_list = []
-    for j in range(steps):
+    for j in range(steps_h):
         output_row_list = []
-        for i in range(steps):
+        for i in range(steps_w):
             output = image_patches[batch_size * idx : batch_size * (idx + 1)]
 
             if padding != 0:
@@ -355,9 +418,9 @@ def merge(image_patches: torch.Tensor, batch_size: int, padding: int = 3) -> tor
                     output = output[..., padding:, :]
                 if i != 0:
                     output = output[..., :, padding:]
-                if j != steps - 1:
+                if j != steps_h - 1:
                     output = output[..., :-padding, :]
-                if i != steps - 1:
+                if i != steps_w - 1:
                     output = output[..., :, :-padding]
 
             output_row_list.append(output)

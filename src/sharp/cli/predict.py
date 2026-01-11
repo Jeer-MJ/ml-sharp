@@ -73,6 +73,24 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Device to run on. ['cpu', 'mps', 'cuda']",
 )
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
+@click.option(
+    "--max-size",
+    type=int,
+    default=1536,
+    help="Maximum edge length for processing. Ignored if --force-resolution is set.",
+)
+@click.option(
+    "--keep-aspect/--no-keep-aspect",
+    is_flag=True,
+    default=True,
+    help="Whether to preserve input aspect ratio vs forcing a square.",
+)
+@click.option(
+    "--force-resolution",
+    type=str,
+    default=None,
+    help="Force a specific resolution (e.g. '4096x2048'). Overrides --max-size and --keep-aspect.",
+)
 def predict_cli(
     input_path: Path,
     output_path: Path,
@@ -80,6 +98,9 @@ def predict_cli(
     with_rendering: bool,
     device: str,
     verbose: bool,
+    max_size: int,
+    keep_aspect: bool,
+    force_resolution: str | None,
 ):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
@@ -142,7 +163,36 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
+        
+        internal_shape = (1536, 1536) # Default fallback
+        if force_resolution:
+            try:
+                res_w, res_h = map(int, force_resolution.lower().split('x'))
+                internal_shape = (res_h, res_w)
+                LOGGER.info(f"Forcing resolution to {res_w}x{res_h}")
+            except ValueError:
+                LOGGER.error(f"Invalid format for --force-resolution: {force_resolution}. Use WxH (e.g. 4096x2048). Using default.")
+        elif keep_aspect:
+             # Calculate aspect ratio preserving dimensions
+            scale = max_size / max(height, width)
+            new_h = int(height * scale)
+            new_w = int(width * scale)
+            
+            # Snap to multiple of 32 (standard for many ViT/UNet architectures)
+            new_h = int(round(new_h / 32)) * 32
+            new_w = int(round(new_w / 32)) * 32
+            internal_shape = (new_h, new_w)
+            LOGGER.info(f"Auto-calculated processing resolution: {new_w}x{new_h} (Original: {width}x{height})")
+        else:
+             internal_shape = (max_size, max_size)
+
+        gaussians = predict_image(
+            gaussian_predictor, 
+            image, 
+            f_px, 
+            torch.device(device), 
+            internal_shape=internal_shape
+        )
 
         LOGGER.info("Saving 3DGS to %s", output_path)
         save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
@@ -161,18 +211,17 @@ def predict_image(
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    internal_shape: tuple[int, int] = (1536, 1536),
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
-    internal_shape = (1536, 1536)
-
-    LOGGER.info("Running preprocessing.")
+    LOGGER.info(f"Running preprocessing with internal shape {internal_shape} (HxW).")
     image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
     disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
     image_resized_pt = F.interpolate(
         image_pt[None],
-        size=(internal_shape[1], internal_shape[0]),
+        size=(internal_shape[0], internal_shape[1]), # internal_shape is (H, W)
         mode="bilinear",
         align_corners=True,
     )
@@ -195,8 +244,8 @@ def predict_image(
         .to(device)
     )
     intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= internal_shape[0] / width
-    intrinsics_resized[1] *= internal_shape[1] / height
+    intrinsics_resized[0] *= internal_shape[1] / width  # Scale by new Width / old Width
+    intrinsics_resized[1] *= internal_shape[0] / height # Scale by new Height / old Height
 
     # Convert Gaussians to metrics space.
     gaussians = unproject_gaussians(
